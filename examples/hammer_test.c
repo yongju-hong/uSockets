@@ -226,8 +226,8 @@ struct us_socket_t *on_http_socket_open(struct us_socket_t *s, int is_client, ch
     opened_connections++;
     printf("Opened: %d\nClosed: %d\n\n", opened_connections, closed_connections);
 
-    if (is_client && opened_connections < 10000) {
-        us_socket_context_connect(SSL, http_context, "localhost", 3000, 0, sizeof(struct http_socket));
+    if (is_client && opened_connections <= 10000 - 2) {
+        us_socket_context_connect(SSL, http_context, "127.0.0.1", 3000, 0, sizeof(struct http_socket));
     }
 
     return perform_random_operation(s);
@@ -283,11 +283,11 @@ int main() {
     us_socket_context_on_timeout(SSL, websocket_context, on_web_socket_timeout);
     us_socket_context_on_end(SSL, websocket_context, on_web_socket_end);
 
-    listen_socket = us_socket_context_listen(SSL, http_context, 0, 3000, 0, sizeof(struct http_socket));
+    listen_socket = us_socket_context_listen(SSL, http_context, "127.0.0.1", 3000, 0, sizeof(struct http_socket));
 
     if (listen_socket) {
         printf("Running hammer test\n");
-        us_socket_context_connect(SSL, http_context, "localhost", 3000, 0, sizeof(struct http_socket));
+        us_socket_context_connect(SSL, http_context, "127.0.0.1", 3000, 0, sizeof(struct http_socket));
         us_loop_run(loop);
     } else {
         printf("Cannot listen to port 3000!\n");
