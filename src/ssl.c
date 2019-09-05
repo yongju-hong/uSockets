@@ -28,6 +28,9 @@
 
 #if defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100000L
 #define USE_OPENSSL_1_1_API
+#else
+#include <pthread.h>
+pthread_mutex_t canl_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 static void bio_set_data(BIO *bio, void *data)
@@ -340,6 +343,10 @@ static BIO_METHOD bio_bucket_method = {
 #endif
 };
 
+static void openssl_init(void) {
+	SSL_library_init();
+}
+
 #endif
 
 /* Lazily inits loop ssl data first time */
@@ -358,7 +365,8 @@ void us_internal_init_loop_ssl_data(struct us_loop_t *loop) {
         BIO_meth_set_read(loop_ssl_data->shared_biom, BIO_s_custom_read);
         BIO_meth_set_ctrl(loop_ssl_data->shared_biom, BIO_s_custom_ctrl);
 #else
-        SSL_library_init();
+        static pthread_once_t openssl_once = PTHREAD_ONCE_INIT;
+        pthread_once(&openssl_once, openssl_init);
         loop_ssl_data->shared_biom = &bio_bucket_method;
 #endif
         loop_ssl_data->shared_rbio = BIO_new(loop_ssl_data->shared_biom);
