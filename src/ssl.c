@@ -26,6 +26,45 @@
 #include <openssl/ssl.h>
 #include <openssl/bio.h>
 
+#if defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100000L
+#define USE_OPENSSL_1_1_API
+#endif
+
+static void bio_set_data(BIO *bio, void *data)
+{
+#ifdef USE_OPENSSL_1_1_API
+        BIO_set_data(bio, data);
+#else
+        bio->ptr = data;
+#endif
+}
+
+static void *bio_get_data(BIO *bio)
+{
+#ifdef USE_OPENSSL_1_1_API
+        return BIO_get_data(bio);
+#else
+        return bio->ptr;
+#endif
+}
+
+static void bio_meth_free(BIO_METHOD *biom)
+{
+#ifdef USE_OPENSSL_1_1_API
+    BIO_meth_free(biom);
+#endif
+}
+
+static int bio_up_ref(BIO *b)
+{
+#ifdef USE_OPENSSL_1_1_API
+    BIO_up_ref(b);
+#else
+    CRYPTO_add(&b->references, 1, CRYPTO_LOCK_BIO);
+#endif
+    return 1;
+}
+
 /* We do not want to block the loop with tons and tons of CPU-intensive work.
  * Spread it out during many loop iterations, prioritizing already open connections,
  * they are far easier on CPU */
@@ -80,7 +119,11 @@ int passphrase_cb(char *buf, int size, int rwflag, void *u) {
 }
 
 int BIO_s_custom_create(BIO *bio) {
+#ifdef USE_OPENSSL_1_1_API
     BIO_set_init(bio, 1);
+#else
+    bio->init = 1;
+#endif
     return 1;
 }
 
@@ -94,7 +137,7 @@ long BIO_s_custom_ctrl(BIO *bio, int cmd, long num, void *user) {
 }
 
 int BIO_s_custom_write(BIO *bio, const char *data, int length) {
-    struct loop_ssl_data *loop_ssl_data = (struct loop_ssl_data *) BIO_get_data(bio);
+    struct loop_ssl_data *loop_ssl_data = (struct loop_ssl_data *) bio_get_data(bio);
 
     //printf("BIO_s_custom_write\n");
 
@@ -112,7 +155,7 @@ int BIO_s_custom_write(BIO *bio, const char *data, int length) {
 }
 
 int BIO_s_custom_read(BIO *bio, char *dst, int length) {
-    struct loop_ssl_data *loop_ssl_data = (struct loop_ssl_data *) BIO_get_data(bio);
+    struct loop_ssl_data *loop_ssl_data = (struct loop_ssl_data *) bio_get_data(bio);
 
     //printf("BIO_s_custom_read\n");
 
@@ -142,8 +185,8 @@ struct us_internal_ssl_socket_t *ssl_on_open(struct us_internal_ssl_socket_t *s,
     s->ssl_write_wants_read = 0;
     SSL_set_bio(s->ssl, loop_ssl_data->shared_rbio, loop_ssl_data->shared_wbio);
 
-    BIO_up_ref(loop_ssl_data->shared_rbio);
-    BIO_up_ref(loop_ssl_data->shared_wbio);
+    bio_up_ref(loop_ssl_data->shared_rbio);
+    bio_up_ref(loop_ssl_data->shared_wbio);
 
     if (is_client) {
         SSL_set_connect_state(s->ssl);
@@ -281,6 +324,24 @@ struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s,
     return s;
 }
 
+#ifndef USE_OPENSSL_1_1_API
+static BIO_METHOD bio_bucket_method = {
+    BIO_TYPE_MEM,
+    "µS BIO",
+    BIO_s_custom_write,
+    BIO_s_custom_read,
+    NULL,                        /* Is this called? */
+    NULL,                        /* Is this called? */
+    BIO_s_custom_ctrl,
+    BIO_s_custom_create,
+    NULL,
+#ifdef OPENSSL_VERSION_NUMBER
+    NULL /* sslc does not have the callback_ctrl field */
+#endif
+};
+
+#endif
+
 /* Lazily inits loop ssl data first time */
 void us_internal_init_loop_ssl_data(struct us_loop_t *loop) {
     if (!loop->data.ssl_data) {
@@ -288,6 +349,7 @@ void us_internal_init_loop_ssl_data(struct us_loop_t *loop) {
 
         loop_ssl_data->ssl_read_output = malloc(LIBUS_RECV_BUFFER_LENGTH + LIBUS_RECV_BUFFER_PADDING * 2);
 
+#ifdef USE_OPENSSL_1_1_API
         OPENSSL_init_ssl(0, NULL);
 
         loop_ssl_data->shared_biom = BIO_meth_new(BIO_TYPE_MEM, "µS BIO");
@@ -295,11 +357,14 @@ void us_internal_init_loop_ssl_data(struct us_loop_t *loop) {
         BIO_meth_set_write(loop_ssl_data->shared_biom, BIO_s_custom_write);
         BIO_meth_set_read(loop_ssl_data->shared_biom, BIO_s_custom_read);
         BIO_meth_set_ctrl(loop_ssl_data->shared_biom, BIO_s_custom_ctrl);
-
+#else
+        SSL_library_init();
+        loop_ssl_data->shared_biom = &bio_bucket_method;
+#endif
         loop_ssl_data->shared_rbio = BIO_new(loop_ssl_data->shared_biom);
         loop_ssl_data->shared_wbio = BIO_new(loop_ssl_data->shared_biom);
-        BIO_set_data(loop_ssl_data->shared_rbio, loop_ssl_data);
-        BIO_set_data(loop_ssl_data->shared_wbio, loop_ssl_data);
+        bio_set_data(loop_ssl_data->shared_rbio, loop_ssl_data);
+        bio_set_data(loop_ssl_data->shared_wbio, loop_ssl_data);
 
         // reset handshake budget (doesn't matter what loop nr we start on)
         loop_ssl_data->last_iteration_nr = 0;
@@ -319,7 +384,7 @@ void us_internal_free_loop_ssl_data(struct us_loop_t *loop) {
         BIO_free(loop_ssl_data->shared_rbio);
         BIO_free(loop_ssl_data->shared_wbio);
 
-        BIO_meth_free(loop_ssl_data->shared_biom);
+        bio_meth_free(loop_ssl_data->shared_biom);
 
         free(loop_ssl_data);
     }
@@ -377,7 +442,11 @@ struct us_internal_ssl_socket_context_t *us_internal_create_ssl_socket_context(s
 
     struct us_internal_ssl_socket_context_t *context = (struct us_internal_ssl_socket_context_t *) us_create_socket_context(0, loop, sizeof(struct us_internal_ssl_socket_context_t) + context_ext_size, no_options);
 
+#ifdef USE_OPENSSL_1_1_API
     context->ssl_context = SSL_CTX_new(TLS_method());
+#else
+    context->ssl_context = SSL_CTX_new(SSLv23_method());
+#endif
     context->is_parent = 1;
     // only parent ssl contexts may need to ignore data
     context->sc.ignore_data = (int (*)(struct us_socket_t *)) ssl_ignore_data;
