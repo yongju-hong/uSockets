@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#ifndef LIBUS_NO_SSL
+#ifdef LIBUS_USE_OPENSSL
 
 #include "libusockets.h"
 #include "internal/internal.h"
@@ -25,6 +25,7 @@
 
 #include <openssl/ssl.h>
 #include <openssl/bio.h>
+#include <openssl/err.h>
 
 #if defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10100000L
 #define USE_OPENSSL_1_1_API
@@ -115,10 +116,10 @@ struct us_internal_ssl_socket_t {
 
 int passphrase_cb(char *buf, int size, int rwflag, void *u) {
     const char *passphrase = (const char *) u;
-    int passphrase_length = strlen(passphrase);
+    size_t passphrase_length = strlen(passphrase);
     memcpy(buf, passphrase, passphrase_length);
     // put null at end? no?
-    return passphrase_length;
+    return (int) passphrase_length;
 }
 
 int BIO_s_custom_create(BIO *bio) {
@@ -232,14 +233,21 @@ struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s,
 
     if (us_internal_ssl_socket_is_shut_down(s)) {
 
-
-        if (SSL_shutdown(s->ssl) == 1) {
+        int ret;
+        if ((ret = SSL_shutdown(s->ssl)) == 1) {
             // two phase shutdown is complete here
             //printf("Two step SSL shutdown complete\n");
 
             return us_internal_ssl_socket_close(s);
-        } else {
-            //printf("Got data when in shutdown?\n");
+        } else if (ret < 0) {
+
+            int err = SSL_get_error(s->ssl, ret);
+
+            if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+                // we need to clear the error queue in case these added to the thread local queue
+                ERR_clear_error();
+            }
+
         }
 
         // no further processing of data when in shutdown state
@@ -257,6 +265,12 @@ struct us_internal_ssl_socket_t *ssl_on_data(struct us_internal_ssl_socket_t *s,
 
             // as far as I know these are the only errors we want to handle
             if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+
+                // clear per thread error queue if it may contain something
+                if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+                    ERR_clear_error();
+                }
+
                 // terminate connection here
                 return us_internal_ssl_socket_close(s);
             } else {
@@ -497,10 +511,10 @@ struct us_internal_ssl_socket_context_t *us_internal_create_ssl_socket_context(s
         if(ca_list == NULL) {
             return 0;
         }
-        SSL_CTX_set_client_CA_list(context->ssl_context, ca_list); 
+        SSL_CTX_set_client_CA_list(context->ssl_context, ca_list);
         if (SSL_CTX_load_verify_locations(context->ssl_context, options.ca_file_name, NULL) != 1) {
             return 0;
-        } 
+        }
         SSL_CTX_set_verify(context->ssl_context, SSL_VERIFY_PEER, NULL);
     }
 
@@ -621,7 +635,10 @@ int us_internal_ssl_socket_write(struct us_internal_ssl_socket_t *s, const char 
         if (err == SSL_ERROR_WANT_READ) {
             // here we need to trigger writable event next ssl_read!
             s->ssl_write_wants_read = 1;
-        } else {
+        } else if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+            // these two errors may add to the error queue, which is per thread and must be cleared
+            ERR_clear_error();
+
             // all errors here except for want write are critical and should not happen
         }
 
@@ -664,6 +681,13 @@ void us_internal_ssl_socket_shutdown(struct us_internal_ssl_socket_t *s) {
         }
 
         if (ret < 0) {
+
+            int err = SSL_get_error(s->ssl, ret);
+            if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+                // clear
+                ERR_clear_error();
+            }
+
             // we get here if we are shutting down while still in init
             us_socket_shutdown(0, &s->s);
         }
